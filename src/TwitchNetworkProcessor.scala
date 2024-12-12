@@ -1,171 +1,136 @@
-import org.apache.spark.sql.{DataFrame, SparkSession, SaveMode}
+import org.apache.spark.sql.{DataFrame, SparkSession, SaveMode, Row}
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.streaming.Trigger
+import org.apache.spark.streaming._
+import org.apache.kafka.common.serialization.StringDeserializer
+import org.apache.spark.streaming.kafka010._
+import org.apache.spark.streaming.kafka010.ConsumerStrategies.Subscribe
+import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
+import org.apache.spark.sql.types._
 
 object TwitchNetworkProcessor {
   def main(args: Array[String]): Unit = {
+    if (args.length < 2) {
+      System.err.println("Usage: TwitchNetworkProcessor <kafka-brokers> <topic-name>")
+      System.exit(1)
+    }
+
+    val kafkaBrokers = args(0)
+    val topicName = args(1)
+
+    println(s"[${java.time.LocalDateTime.now}] Starting Twitch Network Processor")
+    println(s"[${java.time.LocalDateTime.now}] Using Kafka brokers: $kafkaBrokers")
+    println(s"[${java.time.LocalDateTime.now}] Using topic: $topicName")
+
     val spark = SparkSession.builder()
       .appName("TwitchNetworkProcessor")
-      .enableHiveSupport()  // Enable Hive support
+      .enableHiveSupport()
+      .config("spark.streaming.stopGracefullyOnShutdown", "true")
+      .config("spark.streaming.backpressure.enabled", "true")
+      .config("spark.sql.shuffle.partitions", 10)
+      .config("spark.default.parallelism", 10)
       .getOrCreate()
 
-    // Load initial data
-    def loadHiveTable(tableName: String): DataFrame = {
-      val prefix = s"$tableName."
-      var df = spark.read
-        .format("jdbc")
-        .option("url", "jdbc:hive2://headnodehost:10001/;transportMode=http")
-        .option("dbtable", tableName)
-        .load()
+    import spark.implicits._
 
-      df.columns.foreach { colName =>
-        if (colName.startsWith(prefix)) {
-          df = df.withColumnRenamed(colName, colName.stripPrefix(prefix))
-        }
-      }
+    // Kafka configuration
+    val kafkaParams = Map[String, Object](
+      "bootstrap.servers" -> kafkaBrokers,
+      "key.deserializer" -> classOf[StringDeserializer],
+      "value.deserializer" -> classOf[StringDeserializer],
+      "group.id" -> "twitch-network-processor",
+      "auto.offset.reset" -> "latest"
+    )
+
+    // Define the schema for network edges
+    val edgeSchema = StructType(Seq(
+      StructField("user_id_1", LongType, nullable = false),
+      StructField("user_id_2", LongType, nullable = false),
+      StructField("timestamp", LongType, nullable = false)
+    ))
+
+    def loadHiveTable(tableName: String): DataFrame = {
+      println(s"[${java.time.LocalDateTime.now}] Loading Hive table: $tableName")
+      val df = spark.read
+        .format("jdbc")
+        .option("url", "jdbc:hive2://10.0.0.50:10001/;transportMode=http")
+        .option("dbtable", tableName)
+        .option("fetchsize", "10000")
+        .option("batchsize", "10000")
+        .load()
+      println(s"[${java.time.LocalDateTime.now}] Successfully loaded $tableName")
       df
     }
 
-    // Load initial data
-    val edges = loadHiveTable("twitch_edges_hbase")
-    val features = loadHiveTable("twitch_features_hbase")
+    val initialEdges = loadHiveTable("twitch_edges_hbase").cache()
+    val initialFeatures = loadHiveTable("twitch_features_hbase").cache()
 
-    // Create temp views for SQL operations
-    edges.createOrReplaceTempView("edges")
-    features.createOrReplaceTempView("features")
+    println(s"[${java.time.LocalDateTime.now}] Loaded ${initialEdges.count()} edges")
+    println(s"[${java.time.LocalDateTime.now}] Loaded ${initialFeatures.count()} features")
 
-    // Process first level connections
-    val firstLevelConnections = spark.sql("""
-      SELECT
-        user_id_1 as source_user,
-        user_id_2 as friend,
-        COUNT(*) as connection_strength
-      FROM edges
-      GROUP BY user_id_1, user_id_2
-    """)
+    // Debug output for schema
+    println("Schema for initialEdges:")
+    initialEdges.printSchema()
 
-    // Save first level connections to Hive
-    firstLevelConnections.write
-      .mode(SaveMode.Overwrite)
-      .saveAsTable("twitch_first_level_connections")
+    val streamingDF = spark.readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", kafkaBrokers)
+      .option("subscribe", topicName)
+      .option("startingOffsets", "latest")
+      .load()
 
-    // Process second level connections
-    val secondLevelConnections = spark.sql("""
-      SELECT DISTINCT
-        e1.user_id_1 as source_user,
-        e2.user_id_2 as friend_of_friend
-      FROM edges e1
-      JOIN edges e2 ON e1.user_id_2 = e2.user_id_1
-      WHERE e1.user_id_1 != e2.user_id_2
-    """)
+    val query = streamingDF
+      .selectExpr("CAST(value AS STRING)")
+      .writeStream
+      .foreachBatch { (batchDF: DataFrame, batchId: Long) =>
+        if (!batchDF.isEmpty) {
+          println(s"[${java.time.LocalDateTime.now}] Processing batch $batchId")
+          println(s"[${java.time.LocalDateTime.now}] Received ${batchDF.count()} records")
 
-    // Save second level connections to Hive
-    secondLevelConnections.write
-      .mode(SaveMode.Overwrite)
-      .saveAsTable("twitch_second_level_connections")
+          println(s"[${java.time.LocalDateTime.now}] Converting batch to edges format...")
+          val newEdges = batchDF.select(
+            from_json(col("value"), edgeSchema).as("data")
+          ).select("data.*")
 
-    // Process user statistics
-    val userStats = spark.sql("""
-      SELECT
-        e.user_id_1,
-        COUNT(DISTINCT e.user_id_2) as friend_count,
-        f.views,
-        f.language,
-        f.life_time,
-        f.affiliate
-      FROM edges e
-      JOIN features f ON CAST(e.user_id_1 AS STRING) = f.row_key
-      GROUP BY
-        e.user_id_1,
-        f.views,
-        f.language,
-        f.life_time,
-        f.affiliate
-    """)
+          println(s"[${java.time.LocalDateTime.now}] Creating first level connections RDD...")
+          val firstLevelUpdates = newEdges.rdd
+            .map(row => {
+              val userId1 = row.getAs[Long]("user_id_1")
+              val userId2 = row.getAs[Long]("user_id_2")
+              ((userId1, userId2), 1L)
+            })
+            .reduceByKey(_ + _)
+            .map { case ((source, friend), count) =>
+              (source, friend, count)
+            }
+            .toDF("source_user", "friend", "connection_strength")
 
-    // Save user stats to Hive
-    userStats.write
-      .mode(SaveMode.Overwrite)
-      .saveAsTable("twitch_user_stats")
+          println(s"[${java.time.LocalDateTime.now}] Writing first level connections to Hive...")
 
-    // Process and store network metrics
-    spark.sql("""
-      SELECT
-        e.user_id_1 as user_id,
-        COUNT(DISTINCT e.user_id_2) as direct_connections,
-        AVG(f.views) as avg_friend_views,
-        COUNT(DISTINCT sl.friend_of_friend) as indirect_connections
-      FROM edges e
-      LEFT JOIN features f ON CAST(e.user_id_2 AS STRING) = f.row_key
-      LEFT JOIN second_level_connections sl ON e.user_id_1 = sl.source_user
-      GROUP BY e.user_id_1
-    """).write
-      .mode(SaveMode.Overwrite)
-      .saveAsTable("twitch_network_metrics")
+          if (!spark.catalog.tableExists("twitch_first_level_connections")) {
+            firstLevelUpdates.write
+              .mode(SaveMode.Overwrite)
+              .saveAsTable("twitch_first_level_connections")
+          } else {
+            firstLevelUpdates.write
+              .mode(SaveMode.Append)
+              .insertInto("twitch_first_level_connections")
+          }
 
-    // Function to update tables
-    def updateHiveTables(): Unit = {
-      println(s"Starting update at ${java.time.LocalDateTime.now()}")
+          // Print batch summary
+          println(s"[${java.time.LocalDateTime.now}] Batch $batchId processing complete")
+          println(s"[${java.time.LocalDateTime.now}] Summary:")
+          println(s"  - Received records: ${batchDF.count()}")
+          println(s"  - First level connections processed: ${firstLevelUpdates.count()}")
+          println("----------------------------------------")
+        } else {
+          println(s"[${java.time.LocalDateTime.now}] Received empty batch $batchId")
+        }
+      }
+      .trigger(Trigger.ProcessingTime("10 seconds"))
+      .start()
 
-      // Reload data
-      val newEdges = loadHiveTable("twitch_edges")
-      val newFeatures = loadHiveTable("twitch_features")
-
-      newEdges.createOrReplaceTempView("edges")
-      newFeatures.createOrReplaceTempView("features")
-
-      // Update first level connections
-      spark.sql("""
-        SELECT
-          user_id_1 as source_user,
-          user_id_2 as friend,
-          COUNT(*) as connection_strength
-        FROM edges
-        GROUP BY user_id_1, user_id_2
-      """).write
-        .mode(SaveMode.Overwrite)
-        .saveAsTable("twitch_first_level_connections")
-
-      // Update second level connections
-      spark.sql("""
-        SELECT DISTINCT
-          e1.user_id_1 as source_user,
-          e2.user_id_2 as friend_of_friend
-        FROM edges e1
-        JOIN edges e2 ON e1.user_id_2 = e2.user_id_1
-        WHERE e1.user_id_1 != e2.user_id_2
-      """).write
-        .mode(SaveMode.Overwrite)
-        .saveAsTable("twitch_second_level_connections")
-
-      // Update user stats
-      spark.sql("""
-        SELECT
-          e.user_id_1,
-          COUNT(DISTINCT e.user_id_2) as friend_count,
-          f.views,
-          f.language,
-          f.life_time,
-          f.affiliate
-        FROM edges e
-        JOIN features f ON CAST(e.user_id_1 AS STRING) = f.row_key
-        GROUP BY
-          e.user_id_1,
-          f.views,
-          f.language,
-          f.life_time,
-          f.affiliate
-      """).write
-        .mode(SaveMode.Overwrite)
-        .saveAsTable("twitch_user_stats")
-
-      println(s"Completed update at ${java.time.LocalDateTime.now()}")
-    }
-
-    // Keep the application running
-    println("Starting continuous update loop")
-    while(true) {
-      updateHiveTables()
-      Thread.sleep(60000) // Update every minute
-    }
+    println(s"[${java.time.LocalDateTime.now}] Streaming query started. Waiting for data...")
+    query.awaitTermination()
   }
 }
